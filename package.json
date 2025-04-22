@@ -1,13 +1,19 @@
 {
-  "name": "judolslayerproject",
-  "version": "1.0.0",
-  "description": "<h1>Berikut adalah panduan lengkap program pembasmi komen judol</h1>",
+  "name": "youtube-spam-cleaner",
+  "version": "1.1.0",
+  "description": "Tool to automatically detect and remove spam/gambling comments from YouTube videos",
   "main": "index.js",
   "scripts": {
+    "start": "node index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [],
-  "author": "",
+  "keywords": [
+    "youtube",
+    "spam",
+    "cleaner",
+    "moderation"
+  ],
+  "author": "Your Name",
   "license": "ISC",
   "dependencies": {
     "dotenv": "^16.4.7",
