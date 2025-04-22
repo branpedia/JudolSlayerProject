@@ -3,24 +3,30 @@ const fs = require("fs");
 const readline = require("readline");
 const { google } = require("googleapis");
 
-// Load client secrets from credentials.json
+// Configuration
 const SCOPES = ["https://www.googleapis.com/auth/youtube.force-ssl"];
 const TOKEN_PATH = "token.json";
-const youtubeChannelID = process.env.YOUTUBE_CHANNEL_ID; // Replace with your video ID
+const MAX_RESULTS = 100; // Max comments per API call
+const BATCH_SIZE = 50; // Max comments to process at once
+const youtubeChannelID = process.env.YOUTUBE_CHANNEL_ID;
 
-// Load OAuth 2.0 client
+// Authorization setup
 async function authorize() {
-    const credentials = JSON.parse(fs.readFileSync("credentials.json"));
-    const { client_secret, client_id, redirect_uris } = credentials.installed;
-    const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
+    try {
+        const credentials = JSON.parse(fs.readFileSync("credentials.json"));
+        const { client_secret, client_id, redirect_uris } = credentials.installed;
+        const oAuth2Client = new google.auth.OAuth2(client_id, client_secret, redirect_uris[0]);
 
-    // Check if token already exists
-    if (fs.existsSync(TOKEN_PATH)) {
-        oAuth2Client.setCredentials(JSON.parse(fs.readFileSync(TOKEN_PATH)));
-        return oAuth2Client;
+        if (fs.existsSync(TOKEN_PATH)) {
+            oAuth2Client.setCredentials(JSON.parse(fs.readFileSync(TOKEN_PATH)));
+            return oAuth2Client;
+        }
+
+        return await getNewToken(oAuth2Client);
+    } catch (error) {
+        console.error("Authorization error:", error.message);
+        process.exit(1);
     }
-
-    return await getNewToken(oAuth2Client);
 }
 
 function getNewToken(oAuth2Client) {
@@ -30,109 +36,89 @@ function getNewToken(oAuth2Client) {
             scope: SCOPES,
         });
 
-        console.log("Authorize this app by visiting this URL:", authUrl);
-        const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+        console.log("Authorize this app by visiting:", authUrl);
+        const rl = readline.createInterface({
+            input: process.stdin,
+            output: process.stdout
+        });
 
-        rl.question("Enter the code from that page here: ", (code) => {
+        rl.question("Enter authorization code: ", (code) => {
             rl.close();
             oAuth2Client.getToken(code, (err, token) => {
-                if (err) {
-                    console.error("Error retrieving access token", err);
-                    reject(err);
-                    return;
-                }
+                if (err) return reject(err);
                 oAuth2Client.setCredentials(token);
                 fs.writeFileSync(TOKEN_PATH, JSON.stringify(token));
-                console.log("Token stored to", TOKEN_PATH);
+                console.log("Token saved to", TOKEN_PATH);
                 resolve(oAuth2Client);
             });
         });
     });
 }
 
-// Fetch comments
-async function fetchComments(auth, VIDEO_ID) {
+// Comment processing functions
+async function fetchComments(auth, videoId) {
     const youtube = google.youtube({ version: "v3", auth });
 
     try {
         const response = await youtube.commentThreads.list({
             part: "snippet",
-            videoId: VIDEO_ID,
-            maxResults: 100,
+            videoId: videoId,
+            maxResults: MAX_RESULTS,
         });
 
-        const spamComments = [];
-
-        response.data.items.forEach((item) => {
-            const comment = item.snippet.topLevelComment.snippet;
-            const commentText = comment.textDisplay;
-            const commentId = item.id;
-
-            console.log(`Checking comment: "${commentText}"`);
-
-            if (getJudolComment(commentText)) {
-                console.log(`🚨 Spam detected: "${commentText}"`);
-                spamComments.push(commentId);
-            }
-            
-        });
-
-        return spamComments;
+        return response.data.items
+            .filter(item => isSpamComment(item.snippet.topLevelComment.snippet.textDisplay))
+            .map(item => item.id);
     } catch (error) {
-        console.error("Error fetching comments:", error);
+        console.error(`Error fetching comments for video ${videoId}:`, error.message);
         return [];
     }
 }
 
-
-function getJudolComment(text) {
-    const normalizedText = text.normalize("NFKD");
-    if (text !== normalizedText) { 
-        return true
-    }
+function isSpamComment(text) {
+    // Check for suspicious Unicode normalization
+    if (text !== text.normalize("NFKD")) return true;
+    
+    // Check against blocked words list
     const blockedWords = JSON.parse(fs.readFileSync("blockedword.json"));
-
     const lowerText = text.toLowerCase();
-
+    
     return blockedWords.some(word => lowerText.includes(word.toLowerCase()));
 }
 
-// Delete comments
 async function deleteComments(auth, commentIds) {
-    const youtube = google.youtube({ version: "v3", auth });
+    if (commentIds.length === 0) return;
 
-    const totalCommentsToBeDeleted = commentIds.length;
-    let totalDeletedComments = 0;
-    do{
-        const commentIdsChunk = commentIds.splice(0,50);
-        if (commentIdsChunk.length === 0) break;
+    const youtube = google.youtube({ version: "v3", auth });
+    let processed = 0;
+
+    while (commentIds.length > 0) {
+        const batch = commentIds.splice(0, BATCH_SIZE);
         try {
             await youtube.comments.setModerationStatus({
-                id: commentIdsChunk,
+                id: batch,
                 moderationStatus: "rejected"
             });
-            totalDeletedComments += commentIdsChunk.length;
-            console.log(`Progress: ${totalDeletedComments}/${totalCommentsToBeDeleted} (${commentIds.length} remaining)
-Deleted the following comment IDs:`, commentIdsChunk);
+            processed += batch.length;
+            console.log(`Deleted ${processed}/${commentIds.length + processed} comments`);
         } catch (error) {
-            console.error(`Failed to delete these comment IDs: ${commentIdsChunk}:`, error.message);
+            console.error(`Failed to delete batch:`, error.message);
         }
-    } while (commentIds.length > 0);
+    }
 }
 
-async function youtubeContentList(auth) {
+// Video listing function
+async function getChannelVideos(auth) {
     const youtube = google.youtube({ version: "v3", auth });
 
     try {
         const response = await youtube.channels.list({
             part: "contentDetails",
-            id: youtubeChannelID, // ← use forUsername if you're passing a name
+            id: youtubeChannelID,
         });
 
-        const channel = response.data.items[0];
-        const uploadsPlaylistId = channel.contentDetails.relatedPlaylists.uploads;
-
-        const allVideos = [];
+        const uploadsPlaylistId = response.data.items[0].contentDetails.relatedPlaylists.uploads;
+        const videos = [];
         let nextPageToken = "";
 
         do {
@@ -142,39 +128,39 @@ async function youtubeContentList(auth) {
                 maxResults: 50,
                 pageToken: nextPageToken,
             });
-
-            allVideos.push(...playlistResponse.data.items);
+            videos.push(...playlistResponse.data.items);
             nextPageToken = playlistResponse.data.nextPageToken;
         } while (nextPageToken);
-        return allVideos;
+
+        return videos;
     } catch (error) {
-        console.error("Error fetching videos:", error);
+        console.error("Error fetching videos:", error.message);
         return [];
     }
 }
 
+// Main execution
 (async () => {
     try {
+        console.log("🚀 Starting spam comment removal process");
         const auth = await authorize();
-        const contentList = await youtubeContentList(auth);
+        const videos = await getChannelVideos(auth);
 
-    for (const video of contentList) {
-        const title = video.snippet.title;
-        const videoId = video.snippet.resourceId.videoId;
-        console.log(`\n📹 Checking video: ${title} (ID: ${videoId})`);
-        const spamComments = await fetchComments(auth, videoId);
-
-        if (spamComments.length > 0) {
-            console.log(`🚫 Found ${spamComments.length} spam comments. Deleting...`);
-            await deleteComments(auth, spamComments);
-            console.log("✅ Spam comments deleted.");
-        } else {
-            console.log("✅ No spam comments found.");
+        for (const video of videos) {
+            console.log(`\n🔍 Checking video: ${video.snippet.title}`);
+            const spamComments = await fetchComments(auth, video.snippet.resourceId.videoId);
+            
+            if (spamComments.length > 0) {
+                console.log(`⚠️ Found ${spamComments.length} spam comments`);
+                await deleteComments(auth, spamComments);
+                console.log("✅ Spam comments removed");
+            } else {
+                console.log("✅ No spam found");
+            }
         }
-    }
-    
         
+        console.log("\n✨ Process completed successfully");
     } catch (error) {
-        console.error("Error running script:", error);
+        console.error("❌ Error in main process:", error.message);
     }
 })();
